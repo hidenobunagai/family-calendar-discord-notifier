@@ -1,0 +1,26 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Node (念のため)
+node_modules/
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+
+# Env / credentials
+.env
+.env.*
+
+# Build artifacts
+dist/
+build/
+coverage/
+
+# Misc
+.history/
+
+# clasp project config (local only)
+.clasp.json
