@@ -1,10 +1,10 @@
 # Google Calendar → Discord 通知 (GAS + clasp)
 
-共有カレンダーの新規・更新・キャンセルを定期ポーリングで検知し、Discord の Webhook に投稿する Google Apps Script プロジェクトです。Advanced Google Services の Calendar v3 を利用します。
+共有カレンダーの新規・更新・キャンセルを定期ポーリングで検知し、Discord の Webhook に投稿する Google Apps Script プロジェクトです。Google Calendar API (v3) の REST エンドポイントを直接呼び出します。
 
 ## 構成
 
-- `gas/appsscript.json`: マニフェスト（Calendar v3 / スコープ定義 / タイムゾーン）
+- `gas/appsscript.json`: マニフェスト（スコープ定義 / タイムゾーン）
 - `gas/Code.gs`: 差分取得・Discord 送信・トリガー
 - `gas/Utils.gs`: メッセージ整形ユーティリティ
 
@@ -43,10 +43,10 @@ clasp push
 clasp open
 ```
 
-## Advanced Services 有効化
+## Google Calendar API 有効化
 
-- スクリプトエディタ上部の「サービス」から「Calendar API (v3)」を追加
-- 必要に応じて、右上「プロジェクトの設定」→「Google Cloud プロジェクトを表示」で GCP 側の「Google Calendar API」も有効化
+- Apps Script エディタ右上の「プロジェクトの設定」→「Google Cloud プロジェクトを表示」で紐づく Cloud プロジェクトを開き、Google Calendar API を有効化してください。
+- 既存のプロジェクトにリンクしていない場合は、同画面の「Google Cloud プロジェクトを変更」から任意のプロジェクトに関連付けて API を有効化します。
 
 ## Script Properties（必須）
 
@@ -72,6 +72,6 @@ clasp open
 ## トラブルシュート
 
 - 承認で止まる: GCP の OAuth 同意画面で実行アカウントをテストユーザーに追加
-- `Calendar is not defined`: 「サービス」で Calendar API (v3) を追加
+- `Calendar API error (...)`: Cloud プロジェクトで Google Calendar API が有効か確認し、必要なら再承認
 - 403（スコープ不足）: `appsscript.json` に `calendar.readonly` と `script.external_request` が含まれているか確認し、手動実行で再承認
 - 投稿されない: トリガー実行履歴とログ（`Calendar diff: ...`）を確認
