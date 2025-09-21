@@ -1,46 +1,63 @@
-// 設定は Script Properties に保存して利用します。
-// 必要キー: CALENDAR_ID, DISCORD_WEBHOOK_URL, LAST_CHECKED_AT
-
 const PROP_KEYS = {
   lastCheckedAt: 'LAST_CHECKED_AT',
   calendarId: 'CALENDAR_ID',
   webhookUrl: 'DISCORD_WEBHOOK_URL',
 };
 
+const DEFAULT_LOOKBACK_MS = 6 * 60 * 60 * 1000; // 6 hours
+const SAFETY_OFFSET_MS = 60 * 1000; // rewind by 60 seconds to avoid misses
+const CALENDAR_API_BASE = 'https://www.googleapis.com/calendar/v3';
+
 /**
  * 直近の更新差分を取得して Discord に通知
- * Advanced Google Services の Calendar v3 が有効であることが前提
  */
 function pollCalendarAndNotify() {
   const props = PropertiesService.getScriptProperties();
-  const calendarId = props.getProperty(PROP_KEYS.calendarId);
-  const webhookUrl = props.getProperty(PROP_KEYS.webhookUrl);
+  const calendarId = (props.getProperty(PROP_KEYS.calendarId) || '').trim();
+  const webhookUrl = (props.getProperty(PROP_KEYS.webhookUrl) || '').trim();
 
   if (!calendarId || !webhookUrl) {
-    console.warn('Script Properties に CALENDAR_ID / DISCORD_WEBHOOK_URL が未設定です。');
+    logWarn('Script Properties に CALENDAR_ID / DISCORD_WEBHOOK_URL が未設定です。');
     return;
   }
 
-  const nowIso = new Date().toISOString();
-  // 少し巻き戻して取りこぼし防止
-  const lastCheckedRaw = props.getProperty(PROP_KEYS.lastCheckedAt) || new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-  const lastChecked = new Date(new Date(lastCheckedRaw).getTime() - 60 * 1000).toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const lastCheckedDate = computeLastCheckedDate(props.getProperty(PROP_KEYS.lastCheckedAt), now);
+  const lastCheckedIso = lastCheckedDate.toISOString();
 
-  let pageToken = null;
+  let updates;
+  try {
+    updates = fetchCalendarUpdates(calendarId, lastCheckedIso);
+  } catch (err) {
+    logError('Calendar API 呼び出しに失敗しました。設定や権限を確認してください。', err);
+    throw err;
+  }
+
+  logInfo(`Calendar diff: ${updates.length} updates since ${lastCheckedIso} -> ${nowIso}`);
+  if (updates.length) {
+    const tz = Session.getScriptTimeZone() || 'Asia/Tokyo';
+    const messages = updates.map(({ kind, ev }) => buildDiscordMessage(kind, ev, tz));
+    try {
+      postToDiscordInChunks(webhookUrl, messages);
+    } catch (err) {
+      logError('Discord 送信処理でエラーが発生しました。Webhook URL を確認してください。', err);
+      throw err;
+    }
+  }
+
+  props.setProperty(PROP_KEYS.lastCheckedAt, nowIso);
+}
+
+function fetchCalendarUpdates(calendarId, lastCheckedIso) {
   const updates = [];
+  let pageToken = null;
 
   do {
-    const res = Calendar.Events.list(calendarId, {
-      updatedMin: lastChecked,
-      showDeleted: true,
-      singleEvents: false,
-      maxResults: 2500,
-      orderBy: 'updated',
-      pageToken,
-    });
-    if (res && res.items && res.items.length) {
+    const res = listCalendarEvents(calendarId, lastCheckedIso, pageToken);
+    if (res.items && res.items.length) {
       for (const ev of res.items) {
-        const kind = classifyChange(ev, lastChecked);
+        const kind = classifyChange(ev, lastCheckedIso);
         if (!kind) continue;
         updates.push({ kind, ev });
       }
@@ -48,15 +65,65 @@ function pollCalendarAndNotify() {
     pageToken = res.nextPageToken || null;
   } while (pageToken);
 
-  Logger.log(`Calendar diff: ${updates.length} updates since ${lastChecked} -> ${nowIso}`);
-  if (updates.length) {
-    const tz = Session.getScriptTimeZone() || 'Asia/Tokyo';
-    const messages = updates.map(({ kind, ev }) => buildDiscordMessage(kind, ev, tz));
-    postToDiscordInChunks(webhookUrl, messages);
+  return updates;
+}
+
+function computeLastCheckedDate(rawValue, now) {
+  const fallback = now.getTime() - DEFAULT_LOOKBACK_MS;
+  if (!rawValue) {
+    return new Date(fallback - SAFETY_OFFSET_MS);
   }
 
-  // 次回用に時刻更新
-  props.setProperty(PROP_KEYS.lastCheckedAt, nowIso);
+  const parsed = new Date(rawValue);
+  const parsedMs = parsed.getTime();
+  if (Number.isNaN(parsedMs)) {
+    logWarn(`LAST_CHECKED_AT (${rawValue}) が不正だったためリセットします。`);
+    return new Date(fallback - SAFETY_OFFSET_MS);
+  }
+
+  const rewound = Math.max(parsedMs - SAFETY_OFFSET_MS, 0);
+  return new Date(rewound);
+}
+
+function listCalendarEvents(calendarId, updatedMin, pageToken) {
+  const params = {
+    updatedMin,
+    showDeleted: 'true',
+    singleEvents: 'false',
+    maxResults: '2500',
+    orderBy: 'updated',
+  };
+  if (pageToken) params.pageToken = pageToken;
+
+  const query = Object.keys(params)
+    .filter((key) => params[key])
+    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+    .join('&');
+
+  const url = `${CALENDAR_API_BASE}/calendars/${encodeURIComponent(calendarId)}/events${query ? `?${query}` : ''}`;
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code >= 200 && code < 300) {
+    return JSON.parse(text || '{}');
+  }
+
+  let message = `Calendar API error (status ${code})`;
+  try {
+    const body = JSON.parse(text);
+    if (body && body.error && body.error.message) {
+      message += `: ${body.error.message}`;
+    }
+  } catch (parseErr) {
+    message += `: ${text}`;
+  }
+  throw new Error(message);
 }
 
 /**
@@ -103,7 +170,10 @@ function postToDiscord(webhookUrl, content) {
   const res = UrlFetchApp.fetch(webhookUrl, params);
   const code = res.getResponseCode();
   if (code < 200 || code >= 300) {
-    console.error('Discord 送信エラー:', code, res.getContentText());
+    const body = res.getContentText();
+    const err = new Error(`Discord 送信エラー (${code}): ${body}`);
+    logError(err.message);
+    throw err;
   }
 }
 
@@ -126,9 +196,28 @@ function uninstallAllTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   for (const t of triggers) ScriptApp.deleteTrigger(t);
 }
- 
-// 設定�E Script Properties に保存して利用します、E// 忁E��キー: CALENDAR_ID, DISCORD_WEBHOOK_URL, LAST_CHECKED_AT
- 
-const PROP_KEYS = {
-  lastCheckedAt: 'LAST_CHECKED_AT',
-  calendarId: 'CALENDAR_ID',
+
+function logInfo(message) {
+  safeLog(`INFO: ${message}`);
+}
+
+function logWarn(message) {
+  safeLog(`WARN: ${message}`);
+}
+
+function logError(message, err) {
+  let fullMessage = `ERROR: ${message}`;
+  if (err) {
+    const detail = err.stack || err.message || String(err);
+    fullMessage += `\n${detail}`;
+  }
+  safeLog(fullMessage);
+}
+
+function safeLog(message) {
+  try {
+    Logger.log(message);
+  } catch (e) {
+    // ignore logging failures
+  }
+}
